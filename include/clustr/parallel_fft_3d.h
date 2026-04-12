@@ -38,8 +38,11 @@
 #include "clustr/redistribute.h"
 #include "dist_array.h"
 
+#include <chrono>
 #include <complex>
+#include <cmath>
 #include <cstddef>
+#include <iostream>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -47,6 +50,33 @@
 #include <vector>
 
 namespace clustr {
+
+// ── Auto grid selection heuristic ───────────────────────────────────────────
+// Selects a balanced 2D process grid {P0, P1} where P0 * P1 = world_size.
+// Heuristic: prefer grids closest to square (P0 ≈ √world_size ≈ P1).
+// This minimizes the aspect ratio and typically yields good load balance.
+//
+// Examples:
+//   world_size=4:  √4 = 2.0 → {2, 2}
+//   world_size=6:  √6 ≈ 2.4 → try 2: 2×3 ✓ (closer than 1×6)
+//   world_size=12: √12 ≈ 3.5 → try 3: 3×4 ✓ (closer than 2×6)
+inline std::vector<int> auto_grid_selection(int world_size) {
+    if (world_size < 1)
+        throw std::invalid_argument("auto_grid_selection: world_size must be ≥ 1");
+
+    // Start from sqrt(world_size) and work downward to find best factorization
+    int sqrt_size = static_cast<int>(std::sqrt(static_cast<double>(world_size)) + 0.5);
+
+    for (int p0 = sqrt_size; p0 >= 1; --p0) {
+        if (world_size % p0 == 0) {
+            int p1 = world_size / p0;
+            // Return the factorization with p0 closest to sqrt (balanced)
+            return {p0, p1};
+        }
+    }
+
+    throw std::logic_error("auto_grid_selection: no valid factorization found");
+}
 
 template <typename T>
 class ParallelFFT3D {
@@ -59,11 +89,30 @@ public:
 
     // Constructor: set up 2D Cartesian topology and all redistribution plans.
     // Validates 3D shape and that product(grid_dims) == world.size().
-    ParallelFFT3D(Comm& world, shape_t global_shape, std::vector<int> grid_dims)
+    // If grid_dims is empty, auto-selects balanced square grid via auto_grid_selection().
+    ParallelFFT3D(Comm& world, shape_t global_shape, std::vector<int> grid_dims = {})
         : world_(world),
-          global_shape_(validate_3d(std::move(global_shape))),
-          grid_dims_(validate_grid_dims(std::move(grid_dims), world.size()))
+          global_shape_(validate_3d(std::move(global_shape)))
     {
+        // ── Auto-select grid if not provided ────────────────────────────
+#ifdef CLUSTR_BENCHMARK
+        auto bench_start = std::chrono::high_resolution_clock::now();
+#endif
+        if (grid_dims.empty()) {
+            grid_dims = auto_grid_selection(world.size());
+            if (world.rank() == 0) {
+                std::cout << "[ParallelFFT3D] Auto-selected grid: " << grid_dims[0]
+                          << " × " << grid_dims[1] << " for " << world.size() << " ranks\n";
+            }
+        }
+        grid_dims_ = validate_grid_dims(std::move(grid_dims), world.size());
+#ifdef CLUSTR_BENCHMARK
+        auto bench_end = std::chrono::high_resolution_clock::now();
+        auto bench_us = std::chrono::duration_cast<std::chrono::microseconds>(bench_end - bench_start);
+        if (world.rank() == 0) {
+            std::cout << "[ParallelFFT3D::benchmark] constructor setup: " << bench_us.count() << " μs\n";
+        }
+#endif
         // ── Establish Cartesian topology ────────────────────────────────────
         world_.cart_create(grid_dims_);
 
@@ -172,10 +221,17 @@ public:
                                   DistArray<complex_t>& output) {
         validate_forward(input, output);
 
+#ifdef CLUSTR_BENCHMARK
+        auto t_step1_start = std::chrono::high_resolution_clock::now();
+#endif
         // Step 1: Local FFT along axis 2 (in-place on input)
         pocketfft::c2c<T>(
             input.local_shape(), input.strides_bytes(), input.strides_bytes(),
             {2}, true, input.data(), input.data(), T(1));
+#ifdef CLUSTR_BENCHMARK
+        auto t_step1_end = std::chrono::high_resolution_clock::now();
+        auto t_step2_start = std::chrono::high_resolution_clock::now();
+#endif
 
         // Step 2: Redistribute axis 1→2 via P1 comm (input → scratch_b_p1_view_)
         co_await p1_fwd_plan_->execute(input, *scratch_b_p1_view_);
@@ -185,32 +241,71 @@ public:
         std::copy(scratch_b_p1_view_->data(),
                   scratch_b_p1_view_->data() + scratch_b_p1_view_->size(),
                   scratch_b_p0_view_->data());
+#ifdef CLUSTR_BENCHMARK
+        auto t_step2_end = std::chrono::high_resolution_clock::now();
+        auto t_step3_start = std::chrono::high_resolution_clock::now();
+#endif
 
         // Step 3: Local FFT along axis 1 (in-place on scratch_b_p0_view_)
         pocketfft::c2c<T>(
             scratch_b_p0_view_->local_shape(), scratch_b_p0_view_->strides_bytes(), scratch_b_p0_view_->strides_bytes(),
             {1}, true, scratch_b_p0_view_->data(), scratch_b_p0_view_->data(), T(1));
+#ifdef CLUSTR_BENCHMARK
+        auto t_step3_end = std::chrono::high_resolution_clock::now();
+        auto t_step4_start = std::chrono::high_resolution_clock::now();
+#endif
 
         // Step 4: Redistribute axis 0→1 via P0 comm (scratch_b_p0_view_ → output)
         co_await p0_fwd_plan_->execute(*scratch_b_p0_view_, output);
+#ifdef CLUSTR_BENCHMARK
+        auto t_step4_end = std::chrono::high_resolution_clock::now();
+        auto t_step5_start = std::chrono::high_resolution_clock::now();
+#endif
 
         // Step 5: Local FFT along axis 0 (in-place on output)
         pocketfft::c2c<T>(
             output.local_shape(), output.strides_bytes(), output.strides_bytes(),
             {0}, true, output.data(), output.data(), T(1));
+#ifdef CLUSTR_BENCHMARK
+        auto t_step5_end = std::chrono::high_resolution_clock::now();
+        if (world_.rank() == 0) {
+            auto us1 = std::chrono::duration_cast<std::chrono::microseconds>(t_step1_end - t_step1_start);
+            auto us2 = std::chrono::duration_cast<std::chrono::microseconds>(t_step2_end - t_step2_start);
+            auto us3 = std::chrono::duration_cast<std::chrono::microseconds>(t_step3_end - t_step3_start);
+            auto us4 = std::chrono::duration_cast<std::chrono::microseconds>(t_step4_end - t_step4_start);
+            auto us5 = std::chrono::duration_cast<std::chrono::microseconds>(t_step5_end - t_step5_start);
+            std::cout << "[ParallelFFT3D::benchmark] forward: "
+                      << "FFT1=" << us1.count() << "μs, "
+                      << "P1redist=" << us2.count() << "μs, "
+                      << "FFT2=" << us3.count() << "μs, "
+                      << "P0redist=" << us4.count() << "μs, "
+                      << "FFT3=" << us5.count() << "μs\n";
+        }
+#endif
     }
 
     asio::awaitable<void> inverse(DistArray<complex_t>& input,
                                   DistArray<complex_t>& output) {
         validate_inverse(input, output);
 
+#ifdef CLUSTR_BENCHMARK
+        auto t_step1_start = std::chrono::high_resolution_clock::now();
+#endif
         // Step 1: Inverse FFT along axis 0 with normalization (in-place on input)
         pocketfft::c2c<T>(
             input.local_shape(), input.strides_bytes(), input.strides_bytes(),
             {0}, false, input.data(), input.data(), inv_norm_axis0_);
+#ifdef CLUSTR_BENCHMARK
+        auto t_step1_end = std::chrono::high_resolution_clock::now();
+        auto t_step2_start = std::chrono::high_resolution_clock::now();
+#endif
 
         // Step 2: Redistribute axis 1→0 via P0 comm (input → scratch_b_p0_inv_view_)
         co_await p0_inv_plan_->execute(input, *scratch_b_p0_inv_view_);
+#ifdef CLUSTR_BENCHMARK
+        auto t_step2_end = std::chrono::high_resolution_clock::now();
+        auto t_step3_start = std::chrono::high_resolution_clock::now();
+#endif
 
         // Step 3: Inverse FFT along axis 1 with normalization (in-place on scratch_b_p0_inv_view_)
         pocketfft::c2c<T>(
@@ -221,14 +316,38 @@ public:
         std::copy(scratch_b_p0_inv_view_->data(),
                   scratch_b_p0_inv_view_->data() + scratch_b_p0_inv_view_->size(),
                   scratch_b_p1_inv_view_->data());
+#ifdef CLUSTR_BENCHMARK
+        auto t_step3_end = std::chrono::high_resolution_clock::now();
+        auto t_step4_start = std::chrono::high_resolution_clock::now();
+#endif
 
         // Step 4: Redistribute axis 2→1 via P1 comm (scratch_b_p1_inv_view_ → output)
         co_await p1_inv_plan_->execute(*scratch_b_p1_inv_view_, output);
+#ifdef CLUSTR_BENCHMARK
+        auto t_step4_end = std::chrono::high_resolution_clock::now();
+        auto t_step5_start = std::chrono::high_resolution_clock::now();
+#endif
 
         // Step 5: Inverse FFT along axis 2 with normalization (in-place on output)
         pocketfft::c2c<T>(
             output.local_shape(), output.strides_bytes(), output.strides_bytes(),
             {2}, false, output.data(), output.data(), inv_norm_axis2_);
+#ifdef CLUSTR_BENCHMARK
+        auto t_step5_end = std::chrono::high_resolution_clock::now();
+        if (world_.rank() == 0) {
+            auto us1 = std::chrono::duration_cast<std::chrono::microseconds>(t_step1_end - t_step1_start);
+            auto us2 = std::chrono::duration_cast<std::chrono::microseconds>(t_step2_end - t_step2_start);
+            auto us3 = std::chrono::duration_cast<std::chrono::microseconds>(t_step3_end - t_step3_start);
+            auto us4 = std::chrono::duration_cast<std::chrono::microseconds>(t_step4_end - t_step4_start);
+            auto us5 = std::chrono::duration_cast<std::chrono::microseconds>(t_step5_end - t_step5_start);
+            std::cout << "[ParallelFFT3D::benchmark] inverse: "
+                      << "FFT1=" << us1.count() << "μs, "
+                      << "P0redist=" << us2.count() << "μs, "
+                      << "FFT2=" << us3.count() << "μs, "
+                      << "P1redist=" << us4.count() << "μs, "
+                      << "FFT3=" << us5.count() << "μs\n";
+        }
+#endif
     }
 
 private:

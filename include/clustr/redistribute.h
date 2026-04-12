@@ -179,6 +179,13 @@ public:
             recv_starts_[p][w_]  = 0;
             recv_extents_[p][w_] = my_w_size_;
         }
+
+        // ── Pre-allocate Subarray descriptor pools (Phase 9 optimization) ─
+        // Reuse across execute() calls to avoid repeated heap allocations.
+        send_owned_.reserve(n_);
+        recv_owned_.reserve(n_);
+        send_ptrs_.resize(n_, nullptr);
+        recv_ptrs_.resize(n_, nullptr);
     }
 
     // ── Plan accessors ──────────────────────────────────────────────────
@@ -220,29 +227,24 @@ public:
                 "RedistributePlan::execute: output.distributed_axis != w");
 
         // Subarray deletes its move/copy ops, so we own them via unique_ptr
-        // and pass raw pointers to alltoallw. One heap alloc per peer; cheap
-        // compared with the actual network round-trip.
-        std::vector<std::unique_ptr<Subarray<T>>> send_owned;
-        std::vector<std::unique_ptr<Subarray<T>>> recv_owned;
-        send_owned.reserve(n_);
-        recv_owned.reserve(n_);
-
-        std::vector<Subarray<T>*> send_ptrs(n_, nullptr);
-        std::vector<Subarray<T>*> recv_ptrs(n_, nullptr);
+        // and pass raw pointers to alltoallw. Phase 9 optimization: reuse cached
+        // vectors across calls to eliminate repeated heap allocations.
+        send_owned_.clear();
+        recv_owned_.clear();
 
         for (std::size_t p = 0; p < n_; ++p) {
-            send_owned.push_back(std::make_unique<Subarray<T>>(
+            send_owned_.push_back(std::make_unique<Subarray<T>>(
                 input, send_starts_[p], send_extents_[p]));
-            recv_owned.push_back(std::make_unique<Subarray<T>>(
+            recv_owned_.push_back(std::make_unique<Subarray<T>>(
                 output, recv_starts_[p], recv_extents_[p]));
-            send_ptrs[p] = send_owned.back().get();
-            recv_ptrs[p] = recv_owned.back().get();
+            send_ptrs_[p] = send_owned_.back().get();
+            recv_ptrs_[p] = recv_owned_.back().get();
         }
 
         co_await alltoallw<T>(
             comm_,
-            std::span<Subarray<T>* const>(send_ptrs.data(), send_ptrs.size()),
-            std::span<Subarray<T>* const>(recv_ptrs.data(), recv_ptrs.size()));
+            std::span<Subarray<T>* const>(send_ptrs_.data(), send_ptrs_.size()),
+            std::span<Subarray<T>* const>(recv_ptrs_.data(), recv_ptrs_.size()));
     }
 
 private:
@@ -267,6 +269,13 @@ private:
     std::vector<shape_t> send_extents_;
     std::vector<shape_t> recv_starts_;
     std::vector<shape_t> recv_extents_;
+
+    // Cached Subarray descriptor pools (Phase 9 optimization: reuse across execute calls)
+    // Avoids repeated heap allocations on each execute(). Cleared and refilled per call.
+    mutable std::vector<std::unique_ptr<Subarray<T>>> send_owned_;
+    mutable std::vector<std::unique_ptr<Subarray<T>>> recv_owned_;
+    mutable std::vector<Subarray<T>*> send_ptrs_;
+    mutable std::vector<Subarray<T>*> recv_ptrs_;
 };
 
 }  // namespace clustr

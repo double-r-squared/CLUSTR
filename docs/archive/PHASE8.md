@@ -360,7 +360,7 @@ tests/run_fft_3d_local.sh
 
 1. **P0 Communicator Size = 1**: When P0=1 (e.g., 1×3 grid), the P0 redistribution is a trivial self-loopback. The test verifies this works correctly, but performance is not optimized.
 
-2. **Pencil Only**: No support for slab (1D grid) or arbitrary 3D decompositions yet. Phase 7 (2D slab) is separate; could unify under a common framework.
+2. **Pencil Only**: No support for slab (1D grid) or arbitrary 3D decompositions yet. Phase 7 (2D slab) and Phase 8 (3D pencil) are deliberately kept separate to avoid template complexity and compile-time bloat. See `UNIFICATION_ANALYSIS.md` for detailed analysis. Future: if 4D or 3D slab is needed, extract common base class (non-templated) before considering full unification.
 
 3. **Row-Major Layout Only**: Algorithm assumes C-order (row-major) storage. Fortran-order support would require stride adjustments.
 
