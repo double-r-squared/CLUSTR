@@ -1,11 +1,6 @@
-./vscode
-
-./build
-
-./.claudeignore
-
-./tests/
-
-./clustr.conf
-
-./system.conf
+.vscode/
+build/
+.claudeignore
+tests/
+clustr.conf
+system.conf
