@@ -2,6 +2,8 @@
 
 A distributed HPC job scheduler. A central scheduler dispatches compile-and-run jobs to remote worker nodes over a custom binary TCP protocol. The scheduler has a live ncurses TUI; workers are deployed inline from the TUI with no separate terminal required.
 
+![demo](./screenshots/demo.png)
+
 Supports both single-node jobs and multi-node **MPI-style parallel jobs** using a built-in custom MPI implementation — no external MPI library required.
 
 ---
@@ -235,7 +237,26 @@ Headers are installed to `/var/tmp/clustr/` on each worker by `deploy.sh` and pe
 
 Submit any of these from the Jobs page with **Ranks** set to the number of workers you want to use.
 
+
 For full protocol details see [`docs/MPI.md`](docs/MPI.md).
+
+---
+
+## Distributed Multidimensional FFT
+
+This project includes a parallel FFT implementation for distributed multidimensional arrays using the algorithm from [FAST-FFT.md](docs/FAST-FFT.md).
+
+**Status:** Phase 7 (2D slab FFT) complete and validated.
+
+**Test examples:**
+- `jobs/fft_serial_test.cpp` — baseline serial transform (PocketFFT)
+- `jobs/subarray_coalesce_test.cpp` — zero-copy geometry validation
+- `jobs/redistribute_test.cpp` — phase 6: axis redistribution
+- `jobs/fft_2d_test.cpp` — phase 7: parallel 2D slab FFT
+
+Run local validation with `tests/run_fft_2d_local.sh` (localhost oversubscription, all 4 compile-time presets, ranks 2/3/4/8).
+
+For implementation details, architecture decisions, and design rationale see [`docs/MD-FFT.md`](docs/MD-FFT.md).
 
 ---
 
