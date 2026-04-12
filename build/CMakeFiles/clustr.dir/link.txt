@@ -1,0 +1,2 @@
+/usr/bin/ar qc libclustr.a CMakeFiles/clustr.dir/src/protocol.cpp.o CMakeFiles/clustr.dir/src/tcp_server.cpp.o CMakeFiles/clustr.dir/src/capability_detector.cpp.o CMakeFiles/clustr.dir/src/file_transfer.cpp.o CMakeFiles/clustr.dir/src/remote_exec.cpp.o CMakeFiles/clustr.dir/src/process_monitor.cpp.o
+/usr/bin/ranlib libclustr.a

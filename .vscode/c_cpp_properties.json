@@ -1,0 +1,31 @@
+{
+    "configurations": [
+        {
+            "name": "Mac",
+            "includePath": [
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/build/_deps/asio-src/asio/include"
+            ],
+            "defines": [
+                "ASIO_STANDALONE"
+            ],
+            "cppStandard": "c++20",
+            "compilerPath": "/usr/bin/clang++",
+            "intelliSenseMode": "macos-clang-arm64"
+        },
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/build/_deps/asio-src/asio/include"
+            ],
+            "defines": [
+                "ASIO_STANDALONE"
+            ],
+            "cppStandard": "c++20",
+            "compilerPath": "/usr/bin/g++",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}

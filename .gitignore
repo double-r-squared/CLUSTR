@@ -1,0 +1,9 @@
+./vscode
+
+./build
+
+./.claudeignore
+
+./tests/
+
+./clustr.conf

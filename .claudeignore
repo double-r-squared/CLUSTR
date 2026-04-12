@@ -1,0 +1,9 @@
+./vscode
+
+./jobs
+
+./docs/README.md
+
+./build/_deps
+
+./build/CMakeFiles
