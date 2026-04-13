@@ -116,15 +116,18 @@ Multiple deploys to different hosts run safely in parallel — each deploy uses 
 
 Navigate to the **Jobs** page (`2`). Select a `.cpp` file from the `jobs/` browser with arrow keys and press `Enter`.
 
-The submit dialog presents three preset compile commands you can cycle through with `up`/`down`:
+The submit dialog presents compile presets you can cycle through with `up`/`down`:
 
 | Preset | Compile command |
 | --- | --- |
-| **MPI** (default) | Full ASIO/MPI flags, links against `/var/tmp/clustr/include` and `/var/tmp/clustr/asio_include` |
+| **MPI-zc-i / MPI-zc-c** | Zero-copy transport, inline or central recv |
+| **MPI-pu-i / MPI-pu-c** | Pack/unpack transport, inline or central recv |
 | **Simple** | `g++ -O2` — for plain single-node jobs with no dependencies |
 | **Opt** | `g++ -std=c++20 -O3 -march=native` — optimized native build |
 
 Press `Enter` to accept the preset or type a custom command. Set **Ranks** to `1` for a single-node job or `N` for a parallel MPI job across N workers.
+
+If companion files (`.py` scripts, data files) exist alongside the `.cpp`, they appear in a **Files:** row and are automatically bundled into a tarball for transfer. The worker extracts them before compiling.
 
 ---
 
@@ -234,9 +237,9 @@ Headers are installed to `/var/tmp/clustr/` on each worker by `deploy.sh` and pe
 | `jobs/mpi_hello.cpp` | Rank identity, barrier |
 | `jobs/mpi_reduce.cpp` | Distributed sum via reduce + broadcast |
 | `jobs/mpi_scatter_gather.cpp` | Scatter work chunks, parallel compute, gather results |
+| `jobs/python_scatter_gather.cpp` | Python bridge — scatter/compute/gather with a Python kernel |
 
 Submit any of these from the Jobs page with **Ranks** set to the number of workers you want to use.
-
 
 For full protocol details see [`docs/MPI.md`](docs/MPI.md).
 
@@ -244,19 +247,58 @@ For full protocol details see [`docs/MPI.md`](docs/MPI.md).
 
 ## Distributed Multidimensional FFT
 
-This project includes a parallel FFT implementation for distributed multidimensional arrays using the algorithm from [FAST-FFT.md](docs/FAST-FFT.md).
+This project includes parallel 2D and 3D complex-to-complex FFT implementations for distributed arrays, using pencil decomposition on a 2D process grid. Based on the algorithm from [FAST-FFT.md](docs/FAST-FFT.md).
 
-**Status:** Phase 7 (2D slab FFT) complete and validated.
+**Status:** Phase 9 complete (optimizations). All phases validated.
 
-**Test examples:**
+| Phase | Component | Description |
+| --- | --- | --- |
+| 4-5 | Subarray, alltoallw | Zero-copy geometry + MPI-style alltoallw |
+| 6 | RedistributePlan | Axis redistribution with cached descriptors |
+| 7 | ParallelFFT2D | 2D slab FFT (1D process grid) |
+| 8 | ParallelFFT3D | 3D pencil FFT (2D process grid) |
+| 9 | Optimizations | Auto grid selection, subarray caching, compile-time benchmarking |
+
+**Test jobs:**
 - `jobs/fft_serial_test.cpp` — baseline serial transform (PocketFFT)
-- `jobs/subarray_coalesce_test.cpp` — zero-copy geometry validation
-- `jobs/redistribute_test.cpp` — phase 6: axis redistribution
-- `jobs/fft_2d_test.cpp` — phase 7: parallel 2D slab FFT
+- `jobs/fft_2d_test.cpp` — parallel 2D slab FFT
+- `jobs/fft_3d_test.cpp` — parallel 3D pencil FFT
+- `jobs/fft_3d_test_auto.cpp` — 3D FFT with auto grid selection
 
-Run local validation with `tests/run_fft_2d_local.sh` (localhost oversubscription, all 4 compile-time presets, ranks 2/3/4/8).
+**Local validation:**
+```bash
+tests/run_fft_2d_local.sh          # 2D: ranks 2/3/4/8, both transports
+tests/run_fft_3d_local.sh          # 3D: ranks 3/4/6, both transports
+BENCH=1 tests/run_fft_3d_local.sh  # 3D + per-step timing breakdown
+```
 
-For implementation details, architecture decisions, and design rationale see [`docs/MD-FFT.md`](docs/MD-FFT.md).
+For implementation details see [`docs/MD-FFT.md`](docs/MD-FFT.md) and [`docs/PHASE9_OPTIMIZATIONS.md`](docs/PHASE9_OPTIMIZATIONS.md).
+
+---
+
+## Python Bridge
+
+Jobs don't have to be pure C++. The Python bridge wraps a Python script inside a C++ harness that uses the same `CLUSTR_MPI_MAIN` entry point, same scatter/gather collectives, and same stdout reporting as any native job. From the TUI, a Python-backed job is indistinguishable from a C++ one.
+
+**How it works:**
+
+1. The C++ harness does scatter/gather over MPI as usual
+2. Each rank writes its data chunk to a temp file, runs `python3 script.py --input in.bin --output out.bin` via `popen()`, and reads the result back
+3. All Python output is forwarded to stdout — the TUI displays it like any other job
+
+**Multi-file transfer:** When the TUI detects companion files (`.py` scripts, data files) alongside the `.cpp`, it bundles them into a single `.tar.gz` and sends one `FILE_DATA` message. The worker auto-extracts the tarball — one file, one ACK, no protocol changes.
+
+**Example:**
+
+```bash
+# Local test (no TUI needed)
+tests/run_python_bridge.sh
+
+# From the TUI: select jobs/python_scatter_gather.cpp
+# The dialog shows "Files: example_python_job.py" — both are bundled and sent
+```
+
+For full details see [`docs/PYTHON_BRIDGE.md`](docs/PYTHON_BRIDGE.md).
 
 ---
 
@@ -312,15 +354,34 @@ Full scrollable log. Toggle category filters: `j` Job, `w` Worker, `n` Network, 
 
 ```text
 system.conf              # cluster configuration (edit this)
-jobs/                    # job source files (.cpp)
+
+jobs/                    # job source files — submit from the TUI
   mpi_hello.cpp          # MPI example: rank identity + barrier
   mpi_reduce.cpp         # MPI example: distributed reduce
   mpi_scatter_gather.cpp # MPI example: scatter/compute/gather
+  python_scatter_gather.cpp  # Python bridge: scatter/compute(py)/gather
+  example_python_job.py      # Python compute kernel (doubles input values)
+  fft_2d_test.cpp        # Parallel 2D slab FFT test
+  fft_3d_test.cpp        # Parallel 3D pencil FFT test
+  fft_3d_test_auto.cpp   # 3D FFT with auto grid selection
+
+tests/                   # Local validation scripts (localhost oversubscription)
+  run_fft_2d_local.sh    # 2D FFT: ranks 2/3/4/8, both transports
+  run_fft_3d_local.sh    # 3D FFT: ranks 3/4/6, optional benchmarking
+  run_python_bridge.sh   # Python bridge: ranks 3, both transports
+  run_redistribute_local.sh
+  run_cart_sub_local.sh
+
 docs/
   MPI.md                 # Full MPI protocol and API documentation
+  MD-FFT.md              # Distributed FFT architecture and design
+  PYTHON_BRIDGE.md       # Python bridge: pipeline, tarball bundling, writing new jobs
+  PHASE9_OPTIMIZATIONS.md  # Auto grid selection, caching, benchmarking
 
 server/main.cpp          # scheduler entry point
-src/scheduler.cpp        # Scheduler class — dispatch, MPI group setup, message handling
+src/scheduler.cpp        # Scheduler — dispatch, MPI group setup, message handling
+src/file_transfer.cpp    # FILE_DATA/FILE_ACK, tarball bundling + extraction
+src/remote_exec.cpp      # exec_sync (compile), spawn_async (run)
 src/tui/
   tui_state.cpp          # TuiState, Tui construction, shared helpers
   tui_draw.cpp           # per-page draw functions
@@ -335,21 +396,17 @@ scripts/
   deploy.sh              # Bootstrap a remote worker node over SSH
 
 include/
-  protocol.h             # Binary wire protocol (message types, payloads, MPI messages)
+  protocol.h             # Binary wire protocol (message types, payloads)
   scheduler.h            # Scheduler class definition
-  system_conf.h          # system.conf parser (SystemConf, KnownWorker)
+  scheduler_strategy.h   # Pluggable strategy interface + Job struct
+  file_transfer.h        # File transfer + tarball bundling API
   tui.h                  # TUI class, TuiState, TuiCommands, Page, LogCategory
-  scheduler_strategy.h   # Pluggable strategy interface + Job struct (num_ranks)
-  worker_registry.h      # WorkerEntry (peer_port), WorkerRegistry, WorkQueue
+  system_conf.h          # system.conf parser (SystemConf, KnownWorker)
+  worker_registry.h      # WorkerEntry, WorkerRegistry, WorkQueue
   clustr_mpi.h           # Header-only MPI runtime (include in job files)
-
-src/                     # Library implementations
-  protocol.cpp
-  tcp_server.cpp
-  capability_detector.cpp
-  file_transfer.cpp
-  remote_exec.cpp
-  process_monitor.cpp
+  dist_array.h           # Distributed array abstraction for FFT
+  pocketfft_hdronly.h    # PocketFFT — local 1D FFT engine
+  include/clustr/        # MPI internals: transports, recv modes, FFT, redistribute
 ```
 
 ---
@@ -361,7 +418,7 @@ src/                     # Library implementations
 ```text
 Connect -> HELLO -> HELLO_ACK -> CAPABILITY_REPORT
   -> [idle, heartbeating every 5s]
-  -> FILE_DATA -> FILE_ACK
+  -> FILE_DATA -> [extract if .tar.gz] -> FILE_ACK
   -> EXEC_CMD (compile, sync) -> EXEC_RESULT
   -> EXEC_CMD (run, async) -> PROCESS_SPAWNED
   -> [job runs...]
@@ -377,12 +434,15 @@ Connect -> HELLO -> HELLO_ACK -> CAPABILITY_REPORT
   -> PEER_READY (peer_port)
   -> PEER_ROSTER (complete, all ports known)
   -> [write /var/tmp/clustr/mpi_roster.conf]
-  -> FILE_DATA -> FILE_ACK
+  -> FILE_DATA -> [extract if .tar.gz] -> FILE_ACK
+  -> EXEC_CMD (compile, sync) -> EXEC_RESULT
   -> EXEC_CMD (run, async) -> PROCESS_SPAWNED
   -> [job runs, peer mesh established by clustr_mpi.h]
   -> rank 0:   TASK_RESULT -> [back to idle]
   -> rank 1..N: RANK_DONE  -> [back to idle]
 ```
+
+For multi-file jobs (e.g., Python bridge), the scheduler bundles all files into a single `.tar.gz` before sending. The worker auto-extracts on receipt — one file, one ACK, no protocol changes.
 
 Worker logs are written to `/tmp/clustr_worker.log` on each remote machine.
 

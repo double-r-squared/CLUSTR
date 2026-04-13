@@ -59,6 +59,23 @@ void Tui::dialog_submit_job_file(const std::string& filepath) {
 
     std::string default_run = "./" + stem;
 
+    // Auto-detect companion files (e.g. .py scripts) in the same directory.
+    // Any non-C++ source file is offered as a companion to be transferred
+    // alongside the .cpp to the worker.
+    std::vector<std::string> companions;
+    {
+        fs::path src_dir = fs::path(filepath).parent_path();
+        if (fs::is_directory(src_dir)) {
+            for (auto& entry : fs::directory_iterator(src_dir)) {
+                if (!entry.is_regular_file()) continue;
+                std::string ext = entry.path().extension().string();
+                if (ext == ".cpp" || ext == ".h" || ext == ".hpp") continue;
+                companions.push_back(entry.path().string());
+            }
+            std::sort(companions.begin(), companions.end());
+        }
+    }
+
     // Snapshot connected workers for the worker picker
     std::vector<WorkerDisplay> wkrs;
     {
@@ -139,27 +156,44 @@ void Tui::dialog_submit_job_file(const std::string& filepath) {
     int num_ranks = 1;
     try { num_ranks = std::max(1, std::stoi(ranks_str)); } catch (...) {}
 
+    // Show companion files that will be transferred
+    int extra_row = dy + 5;
+    if (!companions.empty()) {
+        mvprintw(extra_row, dx + 2, "Files:   ");
+        std::string names;
+        for (auto& c : companions) {
+            if (!names.empty()) names += ", ";
+            names += fs::path(c).filename().string();
+        }
+        int max_w = dw - 12;
+        if ((int)names.size() > max_w) names = names.substr(0, max_w - 3) + "...";
+        mvprintw(extra_row, dx + 11, "%s", names.c_str());
+        extra_row++;
+    }
+    extra_row++; // blank line
+
     // Worker picker (only shown for single-rank jobs; MPI jobs auto-select)
+    int picker_row = extra_row;
     if (num_ranks == 1) {
-        mvprintw(dy + 6, dx + 2, "Assign to:");
-        mvprintw(dy + 7, dx + 4, "[0] Any idle worker (strategy decides)");
+        mvprintw(picker_row, dx + 2, "Assign to:");
+        mvprintw(picker_row + 1, dx + 4, "[0] Any idle worker (strategy decides)");
         for (int i = 0; i < (int)wkrs.size() && i < 6; i++) {
             std::string label = wkrs[i].display_name.empty()
                                 ? wkrs[i].worker_id : wkrs[i].display_name;
-            mvprintw(dy + 8 + i, dx + 4, "[%d] %-24s  %s  cap:%.3f",
+            mvprintw(picker_row + 2 + i, dx + 4, "[%d] %-24s  %s  cap:%.3f",
                      i + 1,
                      pad(label, 24).c_str(),
                      pad(wkrs[i].state_str, 8).c_str(),
                      wkrs[i].capacity);
         }
     } else {
-        mvprintw(dy + 6, dx + 2, "MPI job: %d ranks - scheduler picks workers automatically",
+        mvprintw(picker_row, dx + 2, "MPI job: %d ranks - scheduler picks workers automatically",
                  num_ranks);
     }
 
     int prompt_row = num_ranks == 1
-                     ? dy + 8 + std::min((int)wkrs.size(), 6)
-                     : dy + 8;
+                     ? picker_row + 2 + std::min((int)wkrs.size(), 6)
+                     : picker_row + 2;
     mvprintw(prompt_row, dx + 2, "Enter [0-%d] then [y] to submit, [Esc] cancel:",
              (int)wkrs.size());
     refresh();
@@ -193,10 +227,11 @@ void Tui::dialog_submit_job_file(const std::string& filepath) {
 
     {
         std::lock_guard<std::mutex> lk(state_.mutex);
-        state_.source_file = filepath;
-        state_.compile_cmd = compile;
-        state_.run_cmd     = run;
-        state_.num_ranks   = static_cast<uint32_t>(num_ranks);
+        state_.source_file     = filepath;
+        state_.compile_cmd     = compile;
+        state_.run_cmd         = run;
+        state_.companion_files = companions;
+        state_.num_ranks       = static_cast<uint32_t>(num_ranks);
     }
     cmds_.submit_job(pinned);
 }

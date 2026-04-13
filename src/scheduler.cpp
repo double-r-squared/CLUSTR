@@ -35,12 +35,14 @@ void Scheduler::start() {
 
 void Scheduler::submit_job(const std::string& pinned_worker_id) {
     std::string src, compile, run;
+    std::vector<std::string> companions;
     uint32_t num_ranks = 1;
     {
         std::lock_guard<std::mutex> lk(ui_.mutex);
         src        = ui_.source_file;
         compile    = ui_.compile_cmd;
         run        = ui_.run_cmd;
+        companions = ui_.companion_files;
         num_ranks  = ui_.num_ranks;
     }
     if (src.empty() || compile.empty() || run.empty()) {
@@ -53,6 +55,7 @@ void Scheduler::submit_job(const std::string& pinned_worker_id) {
     job->source_file      = src;
     job->compile_cmd      = compile;
     job->run_cmd          = run;
+    job->companion_files  = std::move(companions);
     job->pinned_worker_id = pinned_worker_id;
     job->num_ranks        = num_ranks;
 
@@ -450,7 +453,9 @@ void Scheduler::on_peer_ready(Connection::Ptr conn, const Message& msg) {
         pending_run_[w->worker_id]     = job->run_cmd;
 
         try {
-            Message fmsg = make_file_data_msg(job->source_file, new_msg_id());
+            Message fmsg = job->companion_files.empty()
+                ? make_file_data_msg(job->source_file, new_msg_id())
+                : make_bundle_msg(job->source_file, job->companion_files, new_msg_id());
             w->conn->send_message(fmsg);
         } catch (const std::exception& e) { mark_failed(w, e.what()); }
     }
@@ -470,7 +475,9 @@ void Scheduler::dispatch_to(WorkerPtr worker, JobPtr job) {
         LogCategory::Job, worker->worker_id, job->job_id, /*is_summary=*/true);
 
     try {
-        Message fmsg = make_file_data_msg(job->source_file, new_msg_id());
+        Message fmsg = job->companion_files.empty()
+            ? make_file_data_msg(job->source_file, new_msg_id())
+            : make_bundle_msg(job->source_file, job->companion_files, new_msg_id());
         worker->conn->send_message(fmsg);
         log("[FILE_DATA] " + job->source_file + " -> " + worker->worker_id,
             LogCategory::Job, worker->worker_id, job->job_id);
@@ -728,6 +735,7 @@ void Scheduler::on_file_ack(Connection::Ptr conn, const Message& msg) {
 
     log("[FILE_ACK] " + std::string(ack.filename) + " ok on " + worker_id,
         LogCategory::Job, worker_id, job_id, false, /*collapsible=*/true);
+
     worker->state = WorkerState::FILE_READY;
     update_ui_worker(worker);
 

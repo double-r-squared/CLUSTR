@@ -79,6 +79,7 @@ struct TuiState {
     std::string source_file;
     std::string compile_cmd;
     std::string run_cmd;
+    std::vector<std::string> companion_files;   // extra files to send (e.g. .py)
     uint32_t    num_ranks   = 1;
     uint16_t    port = 9999;
 

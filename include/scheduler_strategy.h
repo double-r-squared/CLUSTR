@@ -22,6 +22,10 @@ struct Job {
     std::string compile_cmd;
     std::string run_cmd;
 
+    // Extra files to transfer alongside source_file (e.g. Python scripts).
+    // Each entry is a full local path; only the basename is sent to the worker.
+    std::vector<std::string> companion_files;
+
     // If non-empty, only dispatch to this specific worker (manual pin).
     std::string pinned_worker_id;
 
