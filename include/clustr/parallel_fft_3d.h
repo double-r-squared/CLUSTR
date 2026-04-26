@@ -35,6 +35,7 @@
 
 #include "asio.hpp"
 #include "pocketfft_hdronly.h"
+#include "clustr/bench_hook.h"
 #include "clustr/redistribute.h"
 #include "dist_array.h"
 
@@ -47,6 +48,7 @@
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace clustr {
@@ -78,7 +80,7 @@ inline std::vector<int> auto_grid_selection(int world_size) {
     throw std::logic_error("auto_grid_selection: no valid factorization found");
 }
 
-template <typename T>
+template <typename T, typename BenchHook = DefaultBenchHook>
 class ParallelFFT3D {
     static_assert(std::is_floating_point_v<T>,
         "ParallelFFT3D<T>: T must be a floating-point type (double, float)");
@@ -90,14 +92,21 @@ public:
     // Constructor: set up 2D Cartesian topology and all redistribution plans.
     // Validates 3D shape and that product(grid_dims) == world.size().
     // If grid_dims is empty, auto-selects balanced square grid via auto_grid_selection().
-    ParallelFFT3D(Comm& world, shape_t global_shape, std::vector<int> grid_dims = {})
+    //
+    // BenchHook defaults to DefaultBenchHook which is:
+    //   - NullBenchHook (zero-cost, empty methods) in normal builds
+    //   - TextBenchHook (printf to stdout) when -DCLUSTR_BENCHMARK is set
+    // Pass a user-constructed hook (e.g. JsonSinkBenchHook) to redirect
+    // timing output somewhere else without recompiling this header.
+    ParallelFFT3D(Comm& world, shape_t global_shape,
+                  std::vector<int> grid_dims = {},
+                  BenchHook hook = BenchHook())
         : world_(world),
-          global_shape_(validate_3d(std::move(global_shape)))
+          global_shape_(validate_3d(std::move(global_shape))),
+          hook_(std::move(hook))
     {
         // ── Auto-select grid if not provided ────────────────────────────
-#ifdef CLUSTR_BENCHMARK
-        auto bench_start = std::chrono::high_resolution_clock::now();
-#endif
+        auto setup_tok = hook_.begin("ctor_setup");
         if (grid_dims.empty()) {
             grid_dims = auto_grid_selection(world.size());
             if (world.rank() == 0) {
@@ -106,13 +115,7 @@ public:
             }
         }
         grid_dims_ = validate_grid_dims(std::move(grid_dims), world.size());
-#ifdef CLUSTR_BENCHMARK
-        auto bench_end = std::chrono::high_resolution_clock::now();
-        auto bench_us = std::chrono::duration_cast<std::chrono::microseconds>(bench_end - bench_start);
-        if (world.rank() == 0) {
-            std::cout << "[ParallelFFT3D::benchmark] constructor setup: " << bench_us.count() << " μs\n";
-        }
-#endif
+        hook_.end(setup_tok, "ctor_setup");
         // ── Establish Cartesian topology ────────────────────────────────────
         world_.cart_create(grid_dims_);
 
@@ -221,134 +224,92 @@ public:
                                   DistArray<complex_t>& output) {
         validate_forward(input, output);
 
-#ifdef CLUSTR_BENCHMARK
-        auto t_step1_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.group_begin("forward");
+
         // Step 1: Local FFT along axis 2 (in-place on input)
+        auto tok1 = hook_.begin("fwd_fft_axis2");
         pocketfft::c2c<T>(
             input.local_shape(), input.strides_bytes(), input.strides_bytes(),
             {2}, true, input.data(), input.data(), T(1));
-#ifdef CLUSTR_BENCHMARK
-        auto t_step1_end = std::chrono::high_resolution_clock::now();
-        auto t_step2_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.end(tok1, "fwd_fft_axis2");
 
-        // Step 2: Redistribute axis 1→2 via P1 comm (input → scratch_b_p1_view_)
+        // Step 2: Redistribute axis 1→2 via P1 comm
+        auto tok2 = hook_.begin("fwd_p1_redist");
         co_await p1_fwd_plan_->execute(input, *scratch_b_p1_view_);
-
-        // Sync: copy data from scratch_b_p1_view_ to scratch_b_p0_view_ for next operation
-        // Both have same local_shape and strides, just different distributed_axis annotation
         std::copy(scratch_b_p1_view_->data(),
                   scratch_b_p1_view_->data() + scratch_b_p1_view_->size(),
                   scratch_b_p0_view_->data());
-#ifdef CLUSTR_BENCHMARK
-        auto t_step2_end = std::chrono::high_resolution_clock::now();
-        auto t_step3_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.end(tok2, "fwd_p1_redist");
 
-        // Step 3: Local FFT along axis 1 (in-place on scratch_b_p0_view_)
+        // Step 3: Local FFT along axis 1
+        auto tok3 = hook_.begin("fwd_fft_axis1");
         pocketfft::c2c<T>(
             scratch_b_p0_view_->local_shape(), scratch_b_p0_view_->strides_bytes(), scratch_b_p0_view_->strides_bytes(),
             {1}, true, scratch_b_p0_view_->data(), scratch_b_p0_view_->data(), T(1));
-#ifdef CLUSTR_BENCHMARK
-        auto t_step3_end = std::chrono::high_resolution_clock::now();
-        auto t_step4_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.end(tok3, "fwd_fft_axis1");
 
-        // Step 4: Redistribute axis 0→1 via P0 comm (scratch_b_p0_view_ → output)
+        // Step 4: Redistribute axis 0→1 via P0 comm
+        auto tok4 = hook_.begin("fwd_p0_redist");
         co_await p0_fwd_plan_->execute(*scratch_b_p0_view_, output);
-#ifdef CLUSTR_BENCHMARK
-        auto t_step4_end = std::chrono::high_resolution_clock::now();
-        auto t_step5_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.end(tok4, "fwd_p0_redist");
 
-        // Step 5: Local FFT along axis 0 (in-place on output)
+        // Step 5: Local FFT along axis 0
+        auto tok5 = hook_.begin("fwd_fft_axis0");
         pocketfft::c2c<T>(
             output.local_shape(), output.strides_bytes(), output.strides_bytes(),
             {0}, true, output.data(), output.data(), T(1));
-#ifdef CLUSTR_BENCHMARK
-        auto t_step5_end = std::chrono::high_resolution_clock::now();
-        if (world_.rank() == 0) {
-            auto us1 = std::chrono::duration_cast<std::chrono::microseconds>(t_step1_end - t_step1_start);
-            auto us2 = std::chrono::duration_cast<std::chrono::microseconds>(t_step2_end - t_step2_start);
-            auto us3 = std::chrono::duration_cast<std::chrono::microseconds>(t_step3_end - t_step3_start);
-            auto us4 = std::chrono::duration_cast<std::chrono::microseconds>(t_step4_end - t_step4_start);
-            auto us5 = std::chrono::duration_cast<std::chrono::microseconds>(t_step5_end - t_step5_start);
-            std::cout << "[ParallelFFT3D::benchmark] forward: "
-                      << "FFT1=" << us1.count() << "μs, "
-                      << "P1redist=" << us2.count() << "μs, "
-                      << "FFT2=" << us3.count() << "μs, "
-                      << "P0redist=" << us4.count() << "μs, "
-                      << "FFT3=" << us5.count() << "μs\n";
-        }
-#endif
+        hook_.end(tok5, "fwd_fft_axis0");
+
+        hook_.group_end("forward");
     }
 
     asio::awaitable<void> inverse(DistArray<complex_t>& input,
                                   DistArray<complex_t>& output) {
         validate_inverse(input, output);
 
-#ifdef CLUSTR_BENCHMARK
-        auto t_step1_start = std::chrono::high_resolution_clock::now();
-#endif
-        // Step 1: Inverse FFT along axis 0 with normalization (in-place on input)
+        hook_.group_begin("inverse");
+
+        // Step 1: Inverse FFT along axis 0
+        auto tok1 = hook_.begin("inv_fft_axis0");
         pocketfft::c2c<T>(
             input.local_shape(), input.strides_bytes(), input.strides_bytes(),
             {0}, false, input.data(), input.data(), inv_norm_axis0_);
-#ifdef CLUSTR_BENCHMARK
-        auto t_step1_end = std::chrono::high_resolution_clock::now();
-        auto t_step2_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.end(tok1, "inv_fft_axis0");
 
-        // Step 2: Redistribute axis 1→0 via P0 comm (input → scratch_b_p0_inv_view_)
+        // Step 2: Redistribute axis 1→0 via P0 comm
+        auto tok2 = hook_.begin("inv_p0_redist");
         co_await p0_inv_plan_->execute(input, *scratch_b_p0_inv_view_);
-#ifdef CLUSTR_BENCHMARK
-        auto t_step2_end = std::chrono::high_resolution_clock::now();
-        auto t_step3_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.end(tok2, "inv_p0_redist");
 
-        // Step 3: Inverse FFT along axis 1 with normalization (in-place on scratch_b_p0_inv_view_)
+        // Step 3: Inverse FFT along axis 1
+        auto tok3 = hook_.begin("inv_fft_axis1");
         pocketfft::c2c<T>(
             scratch_b_p0_inv_view_->local_shape(), scratch_b_p0_inv_view_->strides_bytes(), scratch_b_p0_inv_view_->strides_bytes(),
             {1}, false, scratch_b_p0_inv_view_->data(), scratch_b_p0_inv_view_->data(), inv_norm_axis1_);
-
-        // Sync: copy data from scratch_b_p0_inv_view_ to scratch_b_p1_inv_view_ for next operation
         std::copy(scratch_b_p0_inv_view_->data(),
                   scratch_b_p0_inv_view_->data() + scratch_b_p0_inv_view_->size(),
                   scratch_b_p1_inv_view_->data());
-#ifdef CLUSTR_BENCHMARK
-        auto t_step3_end = std::chrono::high_resolution_clock::now();
-        auto t_step4_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.end(tok3, "inv_fft_axis1");
 
-        // Step 4: Redistribute axis 2→1 via P1 comm (scratch_b_p1_inv_view_ → output)
+        // Step 4: Redistribute axis 2→1 via P1 comm
+        auto tok4 = hook_.begin("inv_p1_redist");
         co_await p1_inv_plan_->execute(*scratch_b_p1_inv_view_, output);
-#ifdef CLUSTR_BENCHMARK
-        auto t_step4_end = std::chrono::high_resolution_clock::now();
-        auto t_step5_start = std::chrono::high_resolution_clock::now();
-#endif
+        hook_.end(tok4, "inv_p1_redist");
 
-        // Step 5: Inverse FFT along axis 2 with normalization (in-place on output)
+        // Step 5: Inverse FFT along axis 2
+        auto tok5 = hook_.begin("inv_fft_axis2");
         pocketfft::c2c<T>(
             output.local_shape(), output.strides_bytes(), output.strides_bytes(),
             {2}, false, output.data(), output.data(), inv_norm_axis2_);
-#ifdef CLUSTR_BENCHMARK
-        auto t_step5_end = std::chrono::high_resolution_clock::now();
-        if (world_.rank() == 0) {
-            auto us1 = std::chrono::duration_cast<std::chrono::microseconds>(t_step1_end - t_step1_start);
-            auto us2 = std::chrono::duration_cast<std::chrono::microseconds>(t_step2_end - t_step2_start);
-            auto us3 = std::chrono::duration_cast<std::chrono::microseconds>(t_step3_end - t_step3_start);
-            auto us4 = std::chrono::duration_cast<std::chrono::microseconds>(t_step4_end - t_step4_start);
-            auto us5 = std::chrono::duration_cast<std::chrono::microseconds>(t_step5_end - t_step5_start);
-            std::cout << "[ParallelFFT3D::benchmark] inverse: "
-                      << "FFT1=" << us1.count() << "μs, "
-                      << "P0redist=" << us2.count() << "μs, "
-                      << "FFT2=" << us3.count() << "μs, "
-                      << "P1redist=" << us4.count() << "μs, "
-                      << "FFT3=" << us5.count() << "μs\n";
-        }
-#endif
+        hook_.end(tok5, "inv_fft_axis2");
+
+        hook_.group_end("inverse");
     }
+
+    // Access the bench hook for extracting collected samples after a run.
+    // Only useful with non-null hook types (JsonSinkBenchHook); no-op for the default.
+    BenchHook&       hook()       noexcept { return hook_; }
+    const BenchHook& hook() const noexcept { return hook_; }
 
 private:
     Comm&                           world_;
@@ -356,6 +317,7 @@ private:
     std::optional<Comm>             p1_comm_;  // row sub-comm, size=P1
     shape_t                         global_shape_;
     std::vector<int>                grid_dims_;
+    BenchHook                       hook_;
 
     // Local sizes computed via balanced_block
     std::size_t my_n0_start_, my_n0_size_;
